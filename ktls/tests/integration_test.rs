@@ -862,3 +862,42 @@ async fn ktls_server_rustls_client(
     };
     tokio::join!(server, client)
 }
+
+#[tokio::test]
+async fn vectored_read_scatter_and_close_notify() {
+    let suite = KtlsCipherSuite {
+        version: KtlsVersion::TLS13,
+        typ: KtlsCipherType::AesGcm128,
+    };
+    let (mut server, mut client) = ktls_server_rustls_client(suite).await;
+
+    client
+        .write_all(b"firstsecond")
+        .await
+        .unwrap();
+    let mut first = [0; 5];
+    let mut second = [0; 6];
+    let mut bufs = [
+        io::IoSliceMut::new(&mut first),
+        io::IoSliceMut::new(&mut second),
+    ];
+    assert_eq!(
+        server
+            .read_vectored(&mut bufs)
+            .await
+            .unwrap(),
+        11
+    );
+    assert_eq!(&first, b"first");
+    assert_eq!(&second, b"second");
+
+    client.shutdown().await.unwrap();
+    let mut tail = [0; 1];
+    assert_eq!(
+        server
+            .read_vectored(&mut [io::IoSliceMut::new(&mut tail)])
+            .await
+            .unwrap(),
+        0
+    );
+}

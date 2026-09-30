@@ -1,4 +1,4 @@
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::os::unix::prelude::AsRawFd;
 use std::pin::Pin;
 use std::task;
@@ -50,6 +50,52 @@ where
     /// Returns a mut reference to the original I/O
     pub fn get_mut(&mut self) -> &mut IO {
         &mut self.inner
+    }
+}
+
+impl KtlsStream<tokio::net::TcpStream> {
+    /// Read decrypted application data into multiple buffers.
+    ///
+    /// Tokio's `AsyncRead` trait has no vectored-read method, so this is an
+    /// inherent method for streams backed by a Tokio TCP socket.
+    pub async fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+
+        let Some(first) = bufs
+            .iter()
+            .position(|buf| !buf.is_empty())
+        else {
+            return Ok(0);
+        };
+
+        if self.read_closed {
+            return Ok(0);
+        }
+        if self.drained.is_some() {
+            return self.read(&mut bufs[first]).await;
+        }
+
+        loop {
+            self.inner.readable().await?;
+            match self.inner.try_read_vectored(bufs) {
+                Ok(n) if n != 0 => return Ok(n),
+                Ok(_) => (),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => (),
+                Err(error) => return Err(error),
+            }
+
+            // The scalar path handles TLS alerts and distinguishes a
+            // close_notify from a truncated TCP connection. If a data byte
+            // races with a control record, return it in the first nonempty
+            // slice instead of losing it.
+            let mut byte = [0];
+            let n = self.read(&mut byte).await?;
+            if n != 0 {
+                bufs[first][0] = byte[0];
+            }
+            return Ok(n);
+        }
     }
 }
 
@@ -313,6 +359,24 @@ where
         self.project().inner.poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> task::Poll<io::Result<usize>> {
+        if self.write_closed {
+            return task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+
+        self.project()
+            .inner
+            .poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
@@ -343,5 +407,77 @@ where
 {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn vectored_write_delegates_and_respects_close() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut stream = KtlsStream::new(socket, None);
+        assert!(stream.is_write_vectored());
+
+        let bufs = [IoSlice::new(b"first"), IoSlice::new(b"second")];
+        assert_eq!(
+            stream
+                .write_vectored(&bufs)
+                .await
+                .unwrap(),
+            11
+        );
+        let mut received = [0; 11];
+        peer.read_exact(&mut received)
+            .await
+            .unwrap();
+        assert_eq!(&received, b"firstsecond");
+
+        stream.write_closed = true;
+        assert_eq!(
+            stream
+                .write_vectored(&bufs)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[tokio::test]
+    async fn vectored_read_scatter() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = KtlsStream::new(socket, None);
+
+        peer.write_all(b"firstsecond")
+            .await
+            .unwrap();
+        let mut first = [0; 5];
+        let mut second = [0; 6];
+        let mut bufs = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+        assert_eq!(
+            stream
+                .read_vectored(&mut bufs)
+                .await
+                .unwrap(),
+            11
+        );
+        assert_eq!(&first, b"first");
+        assert_eq!(&second, b"second");
     }
 }
